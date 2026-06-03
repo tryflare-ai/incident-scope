@@ -1,0 +1,197 @@
+name: 'Flare Incident Scope'
+description: 'On-demand audit log analysis for security incidents. Pulls cloud audit logs for a time window, runs AI analysis, and creates a GitHub Issue with a correlated timeline.'
+author: 'Flare AI'
+
+branding:
+  icon: 'alert-circle'
+  color: 'red'
+
+inputs:
+  token:
+    description: 'Flare API key (starts with flr_pr_). Generate one from Settings at tryflare.ai.'
+    required: true
+  time-from:
+    description: 'Start of incident window (ISO 8601, e.g. 2026-01-15T02:00:00Z).'
+    required: true
+  time-to:
+    description: 'End of incident window (ISO 8601). Defaults to current time if empty.'
+    required: false
+    default: ''
+  connector-id:
+    description: 'Flare connector ID. If omitted, uses the most recently created active connector.'
+    required: false
+  severity-filter:
+    description: 'Minimum severity floor for timeline entries: all, medium, high, critical.'
+    required: false
+    default: 'all'
+  api-url:
+    description: 'Flare API endpoint URL. Override only for self-hosted or staging.'
+    required: false
+    default: 'https://www.tryflare.ai/api/webhooks/incident-scope'
+
+outputs:
+  issue-url:
+    description: 'URL of the created GitHub Issue with incident findings.'
+    value: ${{ steps.scope.outputs.issue_url }}
+  total-events:
+    description: 'Total number of audit log events analyzed.'
+    value: ${{ steps.scope.outputs.total_events }}
+  truncated:
+    description: 'Whether the log set was truncated due to volume (true/false).'
+    value: ${{ steps.scope.outputs.truncated }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Flare incident scope analysis
+      id: scope
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        # ── Build JSON payload ─────────────────────────────────────
+        PAYLOAD=$(jq -n \
+          --arg time_from "${{ inputs.time-from }}" \
+          --arg time_to "${{ inputs.time-to }}" \
+          --arg connector_id "${{ inputs.connector-id }}" \
+          --arg severity_filter "${{ inputs.severity-filter }}" \
+          --arg repo "${{ github.repository }}" \
+          --arg triggered_by "${{ github.actor }}" \
+          '{
+            time_from: $time_from,
+            severity_filter: $severity_filter,
+            metadata: {
+              repo: $repo,
+              triggered_by: $triggered_by
+            }
+          }
+          | if $time_to != "" then .time_to = $time_to else . end
+          | if $connector_id != "" then .connector_id = $connector_id else . end')
+
+        # ── Call Flare API ─────────────────────────────────────────
+        echo "::notice::Flare: analyzing audit logs from ${{ inputs.time-from }}..."
+
+        HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+          --max-time 120 \
+          -X POST "${{ inputs.api-url }}" \
+          -H "Authorization: Bearer ${{ inputs.token }}" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD")
+
+        HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+        HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n 1)
+
+        # ── Handle errors ──────────────────────────────────────────
+        if [ "$HTTP_CODE" != "200" ]; then
+          ERROR_MSG=$(echo "$HTTP_BODY" | jq -r '.error // "Unknown error"' 2>/dev/null || echo "HTTP $HTTP_CODE")
+
+          case "$HTTP_CODE" in
+            400)
+              echo "::error::Flare: invalid request. $ERROR_MSG"
+              ;;
+            401)
+              echo "::error::Flare: authentication failed. $ERROR_MSG"
+              ;;
+            429)
+              echo "::error::Flare: daily analysis limit reached (10/day). Try again tomorrow."
+              ;;
+            502)
+              echo "::error::Flare: analysis service temporarily unavailable. Try re-running."
+              ;;
+            *)
+              echo "::error::Flare: API error ($HTTP_CODE): $ERROR_MSG"
+              ;;
+          esac
+
+          echo "issue_url=" >> "$GITHUB_OUTPUT"
+          echo "total_events=0" >> "$GITHUB_OUTPUT"
+          echo "truncated=false" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        # ── Parse response ─────────────────────────────────────────
+        TOTAL_EVENTS=$(echo "$HTTP_BODY" | jq -r '.total_logs_analyzed')
+        TRUNCATED=$(echo "$HTTP_BODY" | jq -r '.truncated')
+        EVENTS_DROPPED=$(echo "$HTTP_BODY" | jq -r '.events_dropped')
+        NARRATIVE=$(echo "$HTTP_BODY" | jq -r '.narrative')
+        TIME_FROM=$(echo "$HTTP_BODY" | jq -r '.time_window.from')
+        TIME_TO=$(echo "$HTTP_BODY" | jq -r '.time_window.to')
+        TIMELINE_COUNT=$(echo "$HTTP_BODY" | jq '.timeline | length')
+
+        echo "total_events=$TOTAL_EVENTS" >> "$GITHUB_OUTPUT"
+        echo "truncated=$TRUNCATED" >> "$GITHUB_OUTPUT"
+
+        # ── Handle empty results ───────────────────────────────────
+        if [ "$TOTAL_EVENTS" = "0" ]; then
+          echo "::notice::Flare: no audit log events found in the specified time window."
+          echo "issue_url=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── Build GitHub Issue body ────────────────────────────────
+        ISSUE_TITLE="Incident Scope: ${TIME_FROM} to ${TIME_TO}"
+
+        # Count severities in timeline
+        CRITICAL_COUNT=$(echo "$HTTP_BODY" | jq '[.timeline[] | select(.severity == "critical")] | length')
+        HIGH_COUNT=$(echo "$HTTP_BODY" | jq '[.timeline[] | select(.severity == "high")] | length')
+        MEDIUM_COUNT=$(echo "$HTTP_BODY" | jq '[.timeline[] | select(.severity == "medium")] | length')
+
+        # Build severity summary
+        SEV_PARTS=""
+        [ "$CRITICAL_COUNT" -gt 0 ] && SEV_PARTS="**$CRITICAL_COUNT critical**"
+        [ "$HIGH_COUNT" -gt 0 ] && SEV_PARTS="${SEV_PARTS:+$SEV_PARTS, }**$HIGH_COUNT high**"
+        [ "$MEDIUM_COUNT" -gt 0 ] && SEV_PARTS="${SEV_PARTS:+$SEV_PARTS, }$MEDIUM_COUNT medium"
+
+        ISSUE_BODY="## Incident Scope: ${TIME_FROM} to ${TIME_TO}
+
+        **Analyzed:** ${TOTAL_EVENTS} audit log events
+        **Timeline events:** ${TIMELINE_COUNT} (${SEV_PARTS:-none above threshold})"
+
+        if [ "$TRUNCATED" = "true" ]; then
+          ISSUE_BODY="${ISSUE_BODY}
+        **Truncated:** yes ($EVENTS_DROPPED events dropped, severity-prioritized)"
+        fi
+
+        ISSUE_BODY="${ISSUE_BODY}
+
+        ---
+
+        ### Narrative
+
+        ${NARRATIVE}
+
+        ### Timeline"
+
+        # Build timeline table
+        TIMELINE_TABLE="
+        | Time | Service | Actor | Action | Severity |
+        |------|---------|-------|--------|----------|"
+
+        TIMELINE_ROWS=$(echo "$HTTP_BODY" | jq -r '.timeline[] | "| \(.timestamp) | \(.service) | \(.actor) | \(.action) | \(.severity) |"')
+        TIMELINE_TABLE="${TIMELINE_TABLE}
+        ${TIMELINE_ROWS}"
+
+        ISSUE_BODY="${ISSUE_BODY}
+        ${TIMELINE_TABLE}
+
+        ---
+
+        > Powered by [Flare](https://tryflare.ai) | Triggered by @${{ github.actor }} via workflow_dispatch"
+
+        # Remove leading whitespace from heredoc-style indentation
+        ISSUE_BODY=$(echo "$ISSUE_BODY" | sed 's/^        //')
+
+        # ── Create GitHub Issue ────────────────────────────────────
+        ISSUE_URL=$(gh issue create \
+          --title "$ISSUE_TITLE" \
+          --body "$ISSUE_BODY" \
+          --label "incident" 2>/dev/null || \
+        gh issue create \
+          --title "$ISSUE_TITLE" \
+          --body "$ISSUE_BODY" 2>/dev/null)
+
+        echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
+
+        echo "::notice::Flare: incident scope complete. $TOTAL_EVENTS events analyzed, $TIMELINE_COUNT timeline entries. Issue: $ISSUE_URL"
