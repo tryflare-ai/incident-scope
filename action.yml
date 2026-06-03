@@ -1,5 +1,5 @@
 name: 'Flare Incident Scope'
-description: 'On-demand audit log analysis for security incidents. Pulls cloud audit logs for a time window, runs AI analysis, and creates a GitHub Issue with a correlated timeline.'
+description: 'On-demand audit log analysis for security incidents. Analyzes a time window and creates a GitHub Issue.'
 author: 'Flare AI'
 
 branding:
