@@ -89,6 +89,11 @@ The incident analysis focuses on:
 - `jq` and `curl` available on the runner (included in `ubuntu-latest`)
 - Repository permission: `issues: write`
 
+## Learn more
+
+- [GCP Audit Log anomaly detection](https://tryflare.ai/gcp-audit-log-anomaly-detection)
+- [Flare documentation](https://docs.tryflare.ai)
+
 ## License
 
 MIT
